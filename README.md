@@ -1,7 +1,7 @@
 # fastfetch-vertical
 
 A vertical, column-based fastfetch layout that opens in its own
-floating window.
+floating window. Concept by me, coding by claude Sonnet 5 (medium)
 
 ## Requirements
 
