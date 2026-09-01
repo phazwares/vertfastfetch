@@ -15,12 +15,7 @@
 # ---------------------------------------------------------------
 # FASTFETCH_VERTICAL_ACCENT
 #   A hex color (with or without a leading #) for the column titles.
-#   Defaults to a neutral blue if unset. To sync with your own
-#   theming tool instead of a fixed color, set this from that tool's
-#   own output before running the script, e.g.:
-#     export FASTFETCH_VERTICAL_ACCENT="$(your-theme-tool --get-accent)"
-#   This script has no built-in knowledge of any specific theming
-#   tool -- it just reads whatever hex value ends up in this variable.
+#   Defaults to a neutral blue if unset.
 #
 # FASTFETCH_VERTICAL_LOGO
 #   Path to a .png image for the logo. Defaults to
