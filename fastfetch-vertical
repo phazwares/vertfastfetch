@@ -1,0 +1,348 @@
+#!/bin/bash
+# GUI_SCRIPT
+# fastfetch-vertical -- a shareable, generic version
+#
+# Renders every module's value as its own vertical (one-character-
+# per-line) column, side by side, with a logo above, both centered
+# and kept re-centered on live window resize. Opens in its own
+# dedicated kitty window if kitty is available; otherwise renders
+# directly in whatever terminal launched it, with the logo skipped
+# rather than attempted and failing (the logo specifically needs
+# kitty's own image protocol -- see REQUIREMENTS below).
+#
+# ---------------------------------------------------------------
+# CONFIGURATION -- two environment variables, both optional
+# ---------------------------------------------------------------
+# FASTFETCH_VERTICAL_ACCENT
+#   A hex color (with or without a leading #) for the column titles.
+#   Defaults to a neutral blue if unset. To sync with your own
+#   theming tool instead of a fixed color, set this from that tool's
+#   own output before running the script, e.g.:
+#     export FASTFETCH_VERTICAL_ACCENT="$(your-theme-tool --get-accent)"
+#   This script has no built-in knowledge of any specific theming
+#   tool -- it just reads whatever hex value ends up in this variable.
+#
+# FASTFETCH_VERTICAL_LOGO
+#   Path to a .png image for the logo. Defaults to
+#   ~/.config/fastfetch/logo.png if unset. Must be a .png specifically
+#   -- confirmed as the format kitty's own "kitty-direct" image
+#   protocol (used here) actually supports for this terminal.
+#
+# FASTFETCH_VERTICAL_FONT_SIZE
+#   One of 8, 10, or 12. Anything else (or unset) falls back to 8.
+#
+# ---------------------------------------------------------------
+# REQUIREMENTS
+# ---------------------------------------------------------------
+# - fastfetch, a reasonably recent version (older releases used
+#   per-module CLI flags like --cpu-format that have since been
+#   removed in favor of the JSON-config-based approach used here)
+# - kitty for the full experience (dedicated floating window, logo).
+#   If kitty isn't installed, this script now detects that and falls
+#   back to rendering directly in whatever terminal launched it, text
+#   columns only, no logo, no dedicated window -- rather than failing
+#   outright. The text-column rendering itself is genuinely terminal-
+#   agnostic (plain ANSI true-color escapes); only the logo and the
+#   dedicated floating window specifically need kitty.
+# - python3
+# - On Hyprland (or any compositor with an equivalent mechanism): a
+#   window rule floating/centering windows with the class
+#   "fastfetch-vertical" -- otherwise this just opens as a normal,
+#   tiled window instead of a floating one. This script itself has no
+#   opinion on which Hyprland config format you use -- it just
+#   launches kitty with a --class flag, nothing more. The window rule
+#   lives entirely in your own Hyprland config, in whichever format
+#   that is. Hyprland's own window rule syntax has changed more than
+#   once recently -- confirmed as of this writing:
+#
+#   Lua-based config (e.g. hyprland.lua) -- Hyprland's own wiki
+#   confirms hyprlang (the traditional .conf format below) is now
+#   deprecated in favor of Lua as of Hyprland 0.55:
+#     hl.window_rule({
+#         match = { class = "^(fastfetch-vertical)$" },
+#         float = true,
+#         center = true,
+#     })
+#
+#   Traditional hyprland.conf -- current syntax as of Hyprland 0.53+
+#   (windowrulev2, seen in many older guides, was itself deprecated in
+#   0.53 -- confirmed directly from Hyprland's own GitHub discussions.
+#   If you're on an older Hyprland release, you may still need the
+#   older windowrulev2 syntax instead):
+#     windowrule = float on, center on, match:class ^(fastfetch-vertical)$
+#
+# ---------------------------------------------------------------
+# ARCHITECTURE NOTES
+# ---------------------------------------------------------------
+# fastfetch itself cannot render vertical text natively -- its format
+# strings do simple {placeholder} substitution on detected values,
+# with no per-character line-splitting capability. This script
+# handles that externally: parsing fastfetch's own --pipe output,
+# splitting each value into individual characters, and laying the
+# results out as columns.
+#
+# --pipe strips all ANSI colors, needed for clean, parseable text --
+# but that would also strip the actual colors from fastfetch's own
+# "colors" module, defeating its purpose. So the color swatches are
+# generated directly in this script instead, using the terminal's own
+# current ANSI palette (whatever kitty is actually configured with),
+# not parsed from fastfetch's own colors module output.
+#
+# Window height is calculated dynamically via a real pre-launch pass
+# (running fastfetch once just to measure, before the actual window
+# ever opens), so the window ends where the content does rather than
+# leaving excess blank space or cutting content off. The same
+# filtering logic (module list, the <=6-character key length filter)
+# is intentionally duplicated between this pre-calculation and the
+# main render below -- keep both in sync if either changes.
+#
+# The whole render is wrapped in a function and re-run on every
+# terminal resize (SIGWINCH), so the logo and text both re-center
+# against the live, current width and stay aligned with each other,
+# not just independently centered against a stale value from launch.
+# The whole render is wrapped in a function and re-run on every
+# terminal resize (SIGWINCH), so the logo and text both re-center
+# against the live, current width and stay aligned with each other,
+# not just independently centered against a stale value from launch.
+#
+# Logo detection: this script's logo rendering specifically depends on
+# kitty (the kitty-direct image protocol, and kitty's own CLI flags
+# for the dedicated floating window). If kitty isn't installed at all,
+# the previous version of this script would fail hard right here --
+# exec-ing a nonexistent command closes whatever launched it
+# immediately. Now: check for kitty first. If present, behave exactly
+# as before (dedicated floating window, logo included). If absent,
+# skip the relaunch and window-sizing entirely and just render
+# directly in whatever terminal/shell launched the script, with the
+# logo attempt skipped rather than attempted and failing.
+if [[ -z "$FASTFETCH_VERTICAL_FLOATING" ]]; then
+	if command -v kitty &> /dev/null; then
+		# Font size: restricted to 8, 10, or 12 -- anything else (or
+		# unset) falls back to 8.
+		case "$FASTFETCH_VERTICAL_FONT_SIZE" in
+			8|10|12) VALIDATED_FONT_SIZE="$FASTFETCH_VERTICAL_FONT_SIZE" ;;
+			*) VALIDATED_FONT_SIZE=8 ;;
+		esac
+
+		CALCULATED_HEIGHT=$(python3 << 'HEIGHTEOF'
+import subprocess, json, tempfile, os
+
+text_modules_config = {
+	"logo": {"type": "none"},
+	"modules": [
+		"title", "os", "kernel", "wm", "host", "cpu", "gpu",
+		"memory", "swap", "disk", "display",
+		"icons", "font", "terminal", "shell", "packages"
+	]
+}
+with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonc', delete=False) as f:
+	json.dump(text_modules_config, f)
+	config_path = f.name
+
+result = subprocess.run(
+	["fastfetch", "--config", config_path, "--pipe"],
+	capture_output=True, text=True
+)
+os.unlink(config_path)
+
+column_heights = []
+for line in result.stdout.splitlines():
+	if ": " not in line:
+		continue
+	key, _, value = line.partition(": ")
+	if len(key) > 6:
+		continue
+	column_heights.append(len(key) + 1 + len(value))
+
+# Colors column: 6 title chars + 1 blank separator + 16 color blocks
+column_heights.append(6 + 1 + 16)
+
+LOGO_HEIGHT = 20
+print(LOGO_HEIGHT + max(column_heights))
+HEIGHTEOF
+		)
+
+		exec kitty --class=fastfetch-vertical \
+			-o initial_window_width=40c \
+			-o initial_window_height=${CALCULATED_HEIGHT}c \
+			-o remember_window_size=no \
+			-o font_size=${VALIDATED_FONT_SIZE}.0 \
+			env FASTFETCH_VERTICAL_FLOATING=1 FASTFETCH_VERTICAL_SHOW_LOGO=1 "$0"
+	else
+		# kitty not found -- no dedicated window, no logo. Render
+		# directly in the current terminal instead of failing.
+		export FASTFETCH_VERTICAL_FLOATING=1
+	fi
+fi
+
+render_fastfetch() {
+	clear
+	python3 << 'PYEOF'
+import subprocess
+import json
+import tempfile
+import os
+import re
+import shutil
+
+def visible_len(s):
+	"""Length excluding ANSI escape codes -- needed because colored
+	text (the Colors column's blocks, and the colored titles) contains
+	invisible escape sequences that Python's own string formatting
+	would otherwise count as visible characters, badly misaligning
+	columns against plain-text ones."""
+	return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+def center_ansi_aware(s, width):
+	vlen = visible_len(s)
+	total_pad = max(0, width - vlen)
+	left = total_pad // 2
+	right = total_pad - left
+	return (' ' * left) + s + (' ' * right)
+
+def hex_to_rgb(hex_color):
+	hex_color = hex_color.lstrip('#')
+	return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+# Title color: reads FASTFETCH_VERTICAL_ACCENT if set, otherwise falls
+# back to a neutral blue. No knowledge of any specific theming tool --
+# just reads whatever hex value is in this env var, if anything.
+ACCENT_HEX = os.environ.get("FASTFETCH_VERTICAL_ACCENT", "89b4fa")
+try:
+	r, g, b = hex_to_rgb(ACCENT_HEX)
+except (ValueError, IndexError):
+	r, g, b = hex_to_rgb("89b4fa")  # malformed value, fall back safely
+TITLE_COLOR = f"\033[38;2;{r};{g};{b}m"
+RESET = "\033[0m"
+
+def colored_title_chars(key):
+	return [f"{TITLE_COLOR}{ch}{RESET}" for ch in key]
+
+# Logo path: reads FASTFETCH_VERTICAL_LOGO if set, otherwise a generic
+# default under fastfetch's own conventional config directory.
+LOGO_PATH = os.environ.get(
+	"FASTFETCH_VERTICAL_LOGO",
+	os.path.expanduser("~/.config/fastfetch/logo.png")
+)
+
+# Recalculated on every call (including every resize), so the logo
+# and text always center against the current, live terminal width --
+# never a stale value from an earlier size.
+TERM_WIDTH = shutil.get_terminal_size().columns
+LOGO_WIDTH = 40
+LOGO_HEIGHT = 20
+
+# ---- Logo: only attempted if FASTFETCH_VERTICAL_SHOW_LOGO is set --
+# the bash portion of this script only sets it when kitty was
+# confirmed available. Skipped entirely otherwise, rather than
+# attempting fastfetch's own kitty-direct logo rendering somewhere it
+# can't work and getting a broken/garbled result. ----
+if os.environ.get("FASTFETCH_VERTICAL_SHOW_LOGO"):
+	logo_left_pad = max(0, (TERM_WIDTH - LOGO_WIDTH) // 2)
+	logo_config = {
+		"logo": {
+			"type": "kitty-direct",
+			"source": LOGO_PATH,
+			"width": LOGO_WIDTH,
+			"height": LOGO_HEIGHT,
+			"padding": {"left": logo_left_pad}
+		},
+		"modules": []
+	}
+	with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonc', delete=False) as f:
+		json.dump(logo_config, f)
+		logo_config_path = f.name
+
+	subprocess.run(["fastfetch", "--config", logo_config_path])
+	os.unlink(logo_config_path)
+
+# ---- Text modules: one fastfetch call, --pipe for clean parsing ----
+text_modules_config = {
+	"logo": {"type": "none"},
+	"modules": [
+		"title", "os", "kernel", "wm", "host", "cpu", "gpu",
+		"memory", "swap", "disk", "display",
+		"icons", "font", "terminal", "shell", "packages"
+	]
+}
+with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonc', delete=False) as f:
+	json.dump(text_modules_config, f)
+	text_config_path = f.name
+
+result = subprocess.run(
+	["fastfetch", "--config", text_config_path, "--pipe"],
+	capture_output=True, text=True
+)
+os.unlink(text_config_path)
+
+columns = {}
+column_order = []
+for line in result.stdout.splitlines():
+	if ": " not in line:
+		continue
+	key, _, value = line.partition(": ")
+	# Only keep modules whose label itself is 6 characters or less --
+	# checked against the actual parsed key, not a hardcoded module
+	# list, so this naturally excludes dynamically-named ones too
+	# (e.g. a long disk mount path), not just fixed-length long ones.
+	if len(key) > 6:
+		continue
+	# Title's own characters stacked above the value's, with one
+	# blank row as a separator -- keeps the whole column consistently
+	# vertical instead of mixing a horizontal header with vertical data.
+	# Title characters are colored; value characters are left plain.
+	columns[key] = colored_title_chars(key) + [""] + list(value)
+	column_order.append(key)
+
+# ---- Colors: generated directly from the terminal's own current
+# ANSI palette, not parsed from fastfetch's own colors module output
+# (see header comment for why). "Colors" is 6 characters, kept under
+# the same length filter as everything else. ----
+COLOR_CODES = list(range(40, 48)) + list(range(100, 108))
+columns["Colors"] = colored_title_chars("Colors") + [""] + [f"\033[{c}m  \033[0m" for c in COLOR_CODES]
+column_order.append("Colors")
+
+# ---- Transpose all columns side by side, minimal spacing ----
+max_height = max(len(v) for v in columns.values())
+col_width = 1  # smallest reasonable width -- just the character
+# itself, no internal padding. Columns joined by a single space
+# for the tightest layout that still keeps adjacent columns visually
+# distinguishable.
+
+rows = []
+for row in range(max_height):
+	cells = []
+	for name in column_order:
+		col = columns[name]
+		cells.append(col[row] if row < len(col) else " ")
+	rows.append(" ".join(center_ansi_aware(c, col_width) for c in cells))
+
+# Center the whole text block within the same terminal width used for
+# the logo above, so both share one reference point -- recalculated
+# fresh on every call, so they stay in line with each other on resize,
+# not just independently centered.
+block_width = max(visible_len(r) for r in rows)
+left_pad = max(0, (TERM_WIDTH - block_width) // 2)
+
+for r in rows:
+	print((" " * left_pad) + r)
+PYEOF
+}
+
+render_fastfetch
+
+# Re-render on every terminal resize (SIGWINCH), so the logo and text
+# both re-center against the new width instead of leaving the
+# original, now-stale centering on screen.
+trap render_fastfetch WINCH
+
+# Blocks here indefinitely rather than using kitty's own --hold (which
+# re-invokes a real shell once the command finishes, showing that
+# shell's own prompt). Since this script itself never exits, kitty
+# never falls back to a shell -- only the fastfetch output stays
+# visible. Close the window normally when done. A repeating short
+# sleep is used instead of one long `sleep infinity` so the WINCH trap
+# has a genuine chance to interrupt and fire between iterations.
+while true; do
+	sleep 1
+done
