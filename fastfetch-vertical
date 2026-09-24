@@ -39,7 +39,7 @@
 # the bottom. If your logo.png has empty space along its bottom edge,
 # that space counts as gap too -- cropping the image in Inkscape
 # (Edit > Resize Page to Selection, Shift+Ctrl+R) removes it at the source.
-export FASTFETCH_VERTICAL_GAP_TRIM="${FASTFETCH_VERTICAL_GAP_TRIM:-4}"
+export FASTFETCH_VERTICAL_GAP_TRIM="${FASTFETCH_VERTICAL_GAP_TRIM:-1}"
 
 if [[ -z "$FASTFETCH_VERTICAL_FLOATING" ]]; then
 	CALCULATED_HEIGHT=$(python3 << 'HEIGHTEOF'
@@ -80,6 +80,15 @@ GAP_TRIM = max(0, int(os.environ.get("FASTFETCH_VERTICAL_GAP_TRIM", "0")))
 print(LOGO_HEIGHT - GAP_TRIM + max(column_heights))
 HEIGHTEOF
 	)
+
+	# Safety net: if the calculation above failed (a Python error, or
+	# fastfetch output it didn't expect), use a reasonable default
+	# instead of handing kitty an empty height, which makes it refuse
+	# to open. Run this script from a terminal to see the actual error.
+	if ! [[ "$CALCULATED_HEIGHT" =~ ^[0-9]+$ ]]; then
+		notify-send "fastfetch-vertical" "Height calculation failed; using a default size. Run it from a terminal to see why." 2>/dev/null
+		CALCULATED_HEIGHT=45
+	fi
 
 	exec kitty --class=fastfetch-vertical \
 		-o initial_window_width=40c \
@@ -182,7 +191,7 @@ logo_left_pad = max(0, (TERM_WIDTH - LOGO_WIDTH) // 2)
 logo_config = {
 	"logo": {
 		"type": "kitty-direct",
-		"source": "/home/phoojee/.backgrounds/current/logo/logo.png",
+		"source": os.path.expanduser("~/.backgrounds/current/logo/logo.png"),
 		"width": LOGO_WIDTH,
 		"height": LOGO_HEIGHT,
 		"padding": {"left": logo_left_pad}
